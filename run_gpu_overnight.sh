@@ -49,8 +49,20 @@ echo "[9/10] Depth recur 5×2"
 RUN_ID=gpu python3 experiments_v2.py depth_recur --num-unique 5 --num-loops 2
 
 # 10. Attention residual (shared QK, per-layer V)
-echo "[10/10] Attn residual"
+echo "[10/13] Attn residual"
 RUN_ID=gpu python3 experiments.py attn_resid
+
+# 11. Stacked: shared QK + shift + conv4 + funnel(3/2)
+echo "[11/13] Stacked (3/2 funnel, conv4)"
+RUN_ID=gpu python3 experiments_v2.py stacked --edge-mult 3 --mid-mult 2 --conv-kernel 4
+
+# 12. Stacked: shared QK + shift + conv4 + funnel(4/1)
+echo "[12/13] Stacked (4/1 funnel, conv4)"
+RUN_ID=gpu2 python3 experiments_v2.py stacked --edge-mult 4 --mid-mult 1 --conv-kernel 4
+
+# 13. Stacked: shared QK + shift + conv2 + even MLP
+echo "[13/13] Stacked (2/2, conv2)"
+RUN_ID=gpu3 python3 experiments_v2.py stacked --edge-mult 2 --mid-mult 2 --conv-kernel 2
 
 echo "===================="
 echo "All done $(date)"
