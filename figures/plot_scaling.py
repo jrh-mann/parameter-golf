@@ -37,7 +37,7 @@ def plot_runs(log_files, labels=None, output="figures/scaling_curve.png"):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         import glob as _glob
-        logs = sorted(_glob.glob("logs/lora_routed_*overnight*.txt") + _glob.glob("logs/baseline_shift_*.txt"))
+        logs = sorted(f for f in _glob.glob("logs/lora_routed_*overnight*.txt") + _glob.glob("logs/baseline_shift_*.txt") + _glob.glob("logs/attn_resid_*.txt") + _glob.glob("logs/exp_*.txt") if "smoke" not in f and "test" not in f)
         files = ["logs/baseline_30min.txt"] + logs
         labels = ["Baseline"] + [
             os.path.basename(f).replace("lora_routed_", "").replace(".txt", "")

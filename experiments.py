@@ -482,6 +482,119 @@ class GPT_SparseMoE(nn.Module):
 
 
 # ==============================================================================
+# EXPERIMENT 5: ATTENTION RESIDUAL (shared QK, per-layer V)
+# ==============================================================================
+
+class SharedQKAttention(nn.Module):
+    """Shared Q/K projections + RoPE across all layers. Cheap positional attention."""
+    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim = num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim)
+        self.c_k = CastedLinear(dim, kv_dim)
+        self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
+        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.scale = self.head_dim ** -0.5
+
+    def __call__(self, x, v):
+        """x provides Q and K (shared), v is pre-computed per-layer values."""
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
+        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        return y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
+
+
+class AttnResidBlock(nn.Module):
+    """Block with attention-based residual: shared QK decides WHERE to look,
+    per-layer V decides WHAT to extract, per-layer O projects back."""
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                 shared_qk):
+        super().__init__()
+        self.attn_norm = RMSNormNoWeight()
+        self.mlp_norm = RMSNormNoWeight()
+        self.shared_qk = shared_qk  # shared across layers
+        kv_dim = num_kv_heads * (dim // num_heads)
+        self.c_v = CastedLinear(dim, kv_dim)  # per-layer V
+        self.proj = CastedLinear(dim, dim)     # per-layer O
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
+        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+        self.shift_weight = mx.zeros((dim,), dtype=mx.float32)
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+
+    def __call__(self, x, x0):
+        # Shift
+        x_shifted = mx.concatenate([mx.zeros_like(x[:, :1, :]), x[:, :-1, :]], axis=1)
+        x = x + self.shift_weight.astype(x.dtype)[None, None, :] * x_shifted
+        # Attention with shared QK, per-layer V
+        x_normed = self.attn_norm(x)
+        bsz, seqlen, dim = x_normed.shape
+        v = self.c_v(x_normed).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        attn_out = self.shared_qk(x_normed, v)
+        attn_out = self.proj(attn_out)
+        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
+
+
+class GPT_AttnResid(nn.Module):
+    """GPT with shared QK attention across all layers. Each layer has its own V and O.
+    Saves ~60% of attention params (Q+K shared, only V+O per layer)."""
+    def __init__(self, vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult,
+                 logit_softcap, rope_base, tied_embed_init_std, qk_gain_init):
+        super().__init__()
+        self.logit_softcap = logit_softcap
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.shared_qk = SharedQKAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.blocks = [
+            AttnResidBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                          self.shared_qk)
+            for _ in range(num_layers)
+        ]
+        self.final_norm = RMSNormNoWeight()
+
+        for b in self.blocks:
+            b.proj.weight = mx.zeros_like(b.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        self.tok_emb.weight = (
+            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+        ).astype(COMPUTE_DTYPE)
+
+    def __call__(self, input_ids):
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x
+        skips = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
+
+    def loss(self, input_ids, target_ids):
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        logits = self.logit_softcap * mx.tanh(
+            (x @ self.tok_emb.weight.astype(x.dtype).T) / self.logit_softcap
+        )
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+
+# ==============================================================================
 # OPTIMIZER SETUP (reused across experiments)
 # ==============================================================================
 
@@ -677,6 +790,16 @@ def run_lora_routed(args, num_stem=3, num_recurrence=6, rank=64, num_a=8, num_b=
 # CLI
 # ==============================================================================
 
+def run_attn_resid(args):
+    model = GPT_AttnResid(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
+        tied_embed_init_std=args.tied_embed_init_std, qk_gain_init=args.qk_gain_init,
+    )
+    return train_experiment(model, args, f"attn_resid_{args.run_id}", "attn_resid (shared QK, per-layer V)")
+
+
 def run_sparse_moe(args, num_stem=3, num_recurrence=6, rank=64, num_a=8, num_b=8):
     model = GPT_SparseMoE(
         vocab_size=args.vocab_size, num_stem=num_stem, num_recurrence=num_recurrence,
@@ -694,6 +817,7 @@ EXPERIMENTS = {
     "routed": run_routed,
     "lora_routed": run_lora_routed,
     "sparse_moe": run_sparse_moe,
+    "attn_resid": run_attn_resid,
 }
 
 if __name__ == "__main__":
