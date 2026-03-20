@@ -52,6 +52,8 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    # Cap validation tokens for fast local iteration (0 = use full split).
+    val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -76,6 +78,12 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+
+    # Neuralese: interleave learned "thinking" vectors between real tokens.
+    neuralese_enabled: bool = bool(int(os.environ.get("NEURALESE_ENABLED", "0")))
+    neuralese_eval_passes: int = int(os.environ.get("NEURALESE_EVAL_PASSES", 1))
+    # Layer index where neuralese gets injected (0 = two-pass, >0 = mid-layer single-pass).
+    neuralese_split_layer: int = int(os.environ.get("NEURALESE_SPLIT_LAYER", 0))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -364,11 +372,15 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+        self.shift_weight = mx.zeros((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # Free prev-token feature: mix in the previous position's hidden state.
+        x_shifted = mx.concatenate([mx.zeros_like(x[:, :1, :]), x[:, :-1, :]], axis=1)
+        x = x + self.shift_weight.astype(x.dtype)[None, None, :] * x_shifted
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -382,7 +394,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, neuralese_enabled: bool = False):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -399,6 +411,9 @@ class GPT(nn.Module):
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+        self.neuralese_enabled = neuralese_enabled
+        if neuralese_enabled:
+            self.neuralese_proj = CastedLinear(dim, dim)
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -406,32 +421,66 @@ class GPT(nn.Module):
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
+        if neuralese_enabled:
+            self.neuralese_proj.weight = mx.zeros_like(self.neuralese_proj.weight)
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array, neuralese: mx.array | None = None,
+                 split_layer: int = 0) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+
+        if neuralese is not None and split_layer <= 0:
+            # Two-pass mode: neuralese already computed, interleave at input.
+            B, T, d = x.shape
+            x = mx.stack([x, neuralese.astype(x.dtype)], axis=2).reshape(B, 2 * T, d)
+
         x0 = x
         skips: list[mx.array] = []
+        num_layers = self.num_encoder_layers + self.num_decoder_layers
 
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+
+            # Mid-layer injection: after split_layer, compute neuralese and interleave.
+            if split_layer > 0 and i + 1 == split_layer:
+                neuralese = self.neuralese_proj(x)
+                B, T, d = x.shape
+                x = mx.stack([x, neuralese.astype(x.dtype)], axis=2).reshape(B, 2 * T, d)
+                # Expand skips and x0 to match 2T length.
+                x0 = mx.stack([x0, x0], axis=2).reshape(B, 2 * T, d)
+                skips = [mx.stack([s, s], axis=2).reshape(B, 2 * T, d) for s in skips]
+
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
+            j = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[j](x, x0)
+
+            # Mid-layer injection in the decoder half.
+            if split_layer > 0 and j + 1 == split_layer:
+                neuralese = self.neuralese_proj(x)
+                B, T, d = x.shape
+                x = mx.stack([x, neuralese.astype(x.dtype)], axis=2).reshape(B, 2 * T, d)
+                x0 = mx.stack([x0, x0], axis=2).reshape(B, 2 * T, d)
+                # Remaining skips (if any) need expansion too.
+                skips = [mx.stack([s, s], axis=2).reshape(B, 2 * T, d) for s in skips]
+
         return self.final_norm(x)
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+    def loss(self, input_ids: mx.array, target_ids: mx.array, neuralese: mx.array | None = None,
+             split_layer: int = 0) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        x = self(input_ids, neuralese=neuralese, split_layer=split_layer)
+        if neuralese is not None or split_layer > 0:
+            # In the interleaved sequence, odd positions (1,3,5,...) are neuralese positions.
+            # The hidden state at position 2i+1 predicts target_ids[:, i].
+            x = x[:, 1::2, :]
+        x = x.reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
@@ -490,7 +539,7 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if (k.startswith("blocks.") or k.startswith("neuralese_proj.")) and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
@@ -722,16 +771,30 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     return dataset_dir.name, actual_train_files, expected_train_files
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
+    if max_tokens > 0:
+        tokens = tokens[: max_tokens + 1]
     usable = ((tokens.size - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+
+def neuralese_loss_fn(model: GPT, input_ids: mx.array, target_ids: mx.array,
+                      split_layer: int = 0) -> mx.array:
+    """Neuralese: generate thinking vectors and interleave with real tokens."""
+    if split_layer > 0:
+        # Mid-layer single-pass: layers before split run at T, layers after at 2T.
+        return model.loss(input_ids, target_ids, split_layer=split_layer)
+    # Two-pass mode: full forward to produce neuralese, then interleaved forward for loss.
+    hidden = model(input_ids)
+    neuralese = model.neuralese_proj(hidden)
+    return model.loss(input_ids, target_ids, neuralese=neuralese)
 
 
 def loss_and_grad_chunked(
@@ -786,6 +849,7 @@ def eval_val(
         y = mx.array(y_np, dtype=mx.int32)
         chunk_token_count = float(y.size)
         total_loss = total_loss + compiled_loss(x, y).astype(mx.float32) * chunk_token_count
+        mx.eval(total_loss)
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
@@ -857,7 +921,7 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -885,6 +949,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        neuralese_enabled=args.neuralese_enabled,
     )
     opt = SplitOptimizers(model, args)
 
@@ -895,9 +960,14 @@ def main() -> None:
     # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
-    compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    if args.neuralese_enabled:
+        _split = args.neuralese_split_layer
+        _loss_fn = lambda x, y: neuralese_loss_fn(model, x, y, split_layer=_split)
+    else:
+        _loss_fn = lambda x, y: model.loss(x, y)
+    compiled_loss = mx.compile(_loss_fn, inputs=model.state, outputs=model.state)
     compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+        nn.value_and_grad(model, _loss_fn),
         inputs=model.state,
         outputs=model.state,
     )
@@ -938,6 +1008,8 @@ def main() -> None:
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    if args.neuralese_enabled:
+        log(f"neuralese:enabled eval_passes:{args.neuralese_eval_passes} split_layer:{args.neuralese_split_layer}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
