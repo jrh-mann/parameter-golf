@@ -595,6 +595,160 @@ class GPT_AttnResid(nn.Module):
 
 
 # ==============================================================================
+# EXPERIMENT 6: ATTN_RESID_OPTIMIZED
+# No attention at layers 0 and 8 (they don't use it), redistribute params.
+# ==============================================================================
+
+class GPT_AttnResidOpt(nn.Module):
+    """Shared QK + per-layer V, but:
+    - Layers 0 and N-1 are MLP-only (no attention, just shift+MLP)
+    - Extra MLP-only output layer added with freed params
+    - Layer N-1 gets wider MLP (3x instead of 2x)
+    """
+    def __init__(self, vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult,
+                 logit_softcap, rope_base, tied_embed_init_std, qk_gain_init,
+                 final_mlp_mult=3, output_mlp_mult=2):
+        super().__init__()
+        self.logit_softcap = logit_softcap
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.shared_qk = SharedQKAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+
+        self.blocks = []
+        for i in range(num_layers):
+            if i == 0 or i == num_layers - 1:
+                # MLP-only blocks for first and last layer (no attn)
+                mult = final_mlp_mult if i == num_layers - 1 else mlp_mult
+                block = type('MLPBlock', (nn.Module,), {
+                    '__init__': lambda self, d, m: (
+                        super(type(self), self).__init__(),
+                        setattr(self, 'mlp_norm', RMSNormNoWeight()),
+                        setattr(self, 'mlp', MLP(d, m)),
+                        setattr(self, 'mlp_scale', mx.ones((d,), dtype=mx.float32)),
+                        setattr(self, 'shift_weight', mx.zeros((d,), dtype=mx.float32)),
+                        setattr(self, 'attn_scale', mx.zeros((d,), dtype=mx.float32)),  # dummy for compat
+                    )[-1],
+                    '__call__': lambda self, x, x0: (
+                        x.__class__.__mro__[0]  # trick to chain expressions
+                    ) and None or None,
+                })
+                # Cleaner: just use a simple class
+                self.blocks.append(self._make_mlp_block(dim, mult))
+            else:
+                self.blocks.append(AttnResidBlock(
+                    dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                    self.shared_qk,
+                ))
+        # Extra output MLP layer
+        self.output_mlp_norm = RMSNormNoWeight()
+        self.output_mlp = MLP(dim, output_mlp_mult)
+        self.output_mlp_scale = mx.ones((dim,), dtype=mx.float32)
+        self.output_mlp.proj.weight = mx.zeros_like(self.output_mlp.proj.weight)
+
+        self.final_norm = RMSNormNoWeight()
+        for b in self.blocks:
+            if hasattr(b, 'proj'):
+                b.proj.weight = mx.zeros_like(b.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        self.tok_emb.weight = (
+            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+        ).astype(COMPUTE_DTYPE)
+
+    def _make_mlp_block(self, dim, mlp_mult):
+        """Create a simple MLP-only block (no attention)."""
+        class _MLPBlock(nn.Module):
+            def __init__(self, d, m):
+                super().__init__()
+                self.mlp_norm = RMSNormNoWeight()
+                self.mlp = MLP(d, m)
+                self.mlp_scale = mx.ones((d,), dtype=mx.float32)
+                self.shift_weight = mx.zeros((d,), dtype=mx.float32)
+            def __call__(self, x, x0):
+                x_shifted = mx.concatenate([mx.zeros_like(x[:, :1, :]), x[:, :-1, :]], axis=1)
+                x = x + self.shift_weight.astype(x.dtype)[None, None, :] * x_shifted
+                x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+                return x
+        return _MLPBlock(dim, mlp_mult)
+
+    def __call__(self, input_ids):
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x; skips = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0); skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips: x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        # Extra output MLP
+        x = x + self.output_mlp_scale.astype(x.dtype)[None, None, :] * self.output_mlp(self.output_mlp_norm(x))
+        return self.final_norm(x)
+
+    def loss(self, input_ids, target_ids):
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        logits = self.logit_softcap * mx.tanh(
+            (x @ self.tok_emb.weight.astype(x.dtype).T) / self.logit_softcap
+        )
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+
+class GPT_AttnResidLoop(GPT_AttnResidOpt):
+    """AttnResidOpt but loops a range of layers for extra depth at zero param cost."""
+    def __init__(self, *a, loop_start=5, loop_end=8, num_loops=2, **kw):
+        super().__init__(*a, **kw)
+        self.loop_start = loop_start
+        self.loop_end = loop_end
+        self.num_loops = num_loops
+
+    def __call__(self, input_ids, num_loops=None):
+        if num_loops is None:
+            num_loops = self.num_loops
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x; skips = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0); skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips: x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            j = self.num_encoder_layers + i
+            x = self.blocks[j](x, x0)
+            # After the loop_end block, repeat loop_start..loop_end
+            if j + 1 == self.loop_end:
+                for _ in range(num_loops - 1):
+                    for k in range(self.loop_start, self.loop_end):
+                        x = self.blocks[k](x, x0)
+        x = x + self.output_mlp_scale.astype(x.dtype)[None, None, :] * self.output_mlp(self.output_mlp_norm(x))
+        return self.final_norm(x)
+
+
+def run_attn_resid_loop(args, final_mlp_mult=3, loop_start=5, loop_end=8, num_loops=2):
+    model = GPT_AttnResidLoop(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
+        tied_embed_init_std=args.tied_embed_init_std, qk_gain_init=args.qk_gain_init,
+        final_mlp_mult=final_mlp_mult, loop_start=loop_start, loop_end=loop_end, num_loops=num_loops,
+    )
+    return train_experiment(model, args,
+        f"exp_attn_resid_loop_L{loop_start}-{loop_end}x{num_loops}_fm{final_mlp_mult}_{args.run_id}",
+        f"attn_resid_loop: L{loop_start}-{loop_end} x{num_loops}, final_mlp={final_mlp_mult}x")
+
+
+def run_attn_resid_opt(args, final_mlp_mult=3, output_mlp_mult=2):
+    model = GPT_AttnResidOpt(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
+        tied_embed_init_std=args.tied_embed_init_std, qk_gain_init=args.qk_gain_init,
+        final_mlp_mult=final_mlp_mult, output_mlp_mult=output_mlp_mult,
+    )
+    return train_experiment(model, args, f"exp_attn_resid_opt_fm{final_mlp_mult}_om{output_mlp_mult}_{args.run_id}",
+                           f"attn_resid_opt: final_mlp={final_mlp_mult}x, output_mlp={output_mlp_mult}x")
+
+
+# ==============================================================================
 # OPTIMIZER SETUP (reused across experiments)
 # ==============================================================================
 
@@ -729,8 +883,13 @@ def train_experiment(model, args, run_id, log_prefix=""):
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
-    # Quantize and roundtrip eval.
+    # Save raw model for analysis.
     flat_state = {k: v for k, v in tree_flatten(model.state)}
+    raw_path = out_dir / f"{run_id}_mlx_model.npz"
+    mx.savez(str(raw_path), **flat_state)
+    log(f"saved_model:{raw_path}")
+
+    # Quantize and roundtrip eval.
     quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
@@ -812,13 +971,461 @@ def run_sparse_moe(args, num_stem=3, num_recurrence=6, rank=64, num_a=8, num_b=8
                            f"sparse_moe stem={num_stem} recurrence={num_recurrence} rank={rank} a={num_a} b={num_b}")
 
 
+# ==============================================================================
+# EXPERIMENT 7: STOCHASTIC THINKING (classifier-free guidance for thinking slots)
+# ==============================================================================
+
+class GPT_StochasticThink(nn.Module):
+    """Baseline GPT + shift + stochastic thinking slots.
+    During training: 50% chance of inserting thinking slots (proj(embed(t))).
+    At eval: always insert, optionally do iterative refinement.
+    Single forward pass. Full gradients when slots present.
+    """
+    def __init__(self, vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult,
+                 logit_softcap, rope_base, tied_embed_init_std, qk_gain_init,
+                 think_prob=0.5):
+        super().__init__()
+        self.logit_softcap = logit_softcap
+        self.think_prob = think_prob
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.think_proj = CastedLinear(dim, dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.blocks = [
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            for _ in range(num_layers)
+        ]
+        self.final_norm = RMSNormNoWeight()
+
+        for b in self.blocks:
+            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        self.tok_emb.weight = (
+            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+        ).astype(COMPUTE_DTYPE)
+        self.think_proj.weight = mx.zeros_like(self.think_proj.weight)
+
+    def forward_with_slots(self, x, thinking):
+        """Forward pass with interleaved thinking slots."""
+        B, T, d = x.shape
+        x = mx.stack([x, thinking.astype(x.dtype)], axis=2).reshape(B, 2 * T, d)
+        x0 = x; skips = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0); skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips: x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
+
+    def forward_no_slots(self, x):
+        """Normal forward pass without thinking slots."""
+        x0 = x; skips = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0); skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips: x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
+
+    def __call__(self, input_ids, use_thinking=None):
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        if use_thinking is None:
+            # Stochastic during training
+            use_thinking = mx.random.uniform() < self.think_prob
+        if use_thinking:
+            thinking = self.think_proj(x)
+            return self.forward_with_slots(x, thinking)
+        else:
+            return self.forward_no_slots(x)
+
+    def loss(self, input_ids, target_ids):
+        x = self(input_ids)
+        # If we used thinking slots, extract from odd positions
+        if x.shape[1] == input_ids.shape[1] * 2:
+            x = x[:, 1::2, :]
+        x = x.reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        logits = self.logit_softcap * mx.tanh(
+            (x @ self.tok_emb.weight.astype(x.dtype).T) / self.logit_softcap
+        )
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+    def loss_with_thinking(self, input_ids, target_ids):
+        """Always use thinking slots (for eval)."""
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        thinking = self.think_proj(x)
+        out = self.forward_with_slots(x, thinking)
+        out = out[:, 1::2, :]
+        out = out.reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        logits = self.logit_softcap * mx.tanh(
+            (out @ self.tok_emb.weight.astype(out.dtype).T) / self.logit_softcap
+        )
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+
+def run_stochastic_think(args, think_prob=0.5):
+    model = GPT_StochasticThink(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
+        tied_embed_init_std=args.tied_embed_init_std, qk_gain_init=args.qk_gain_init,
+        think_prob=think_prob,
+    )
+
+    # Use stochastic loss for training, thinking loss for eval
+    compiled_train = mx.compile(
+        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+        inputs=model.state, outputs=model.state,
+    )
+    compiled_eval = mx.compile(
+        lambda x, y: model.loss_with_thinking(x, y),
+        inputs=model.state, outputs=model.state,
+    )
+
+    # Custom training loop that uses different loss for train vs eval
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_id = f"exp_stochastic_think_p{int(think_prob*100)}_{args.run_id}"
+    logfile = out_dir / f"{run_id}.txt"
+
+    def log(msg, console=True):
+        if console: print(msg)
+        with logfile.open("a", encoding="utf-8") as f: print(msg, file=f)
+
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    dataset_name, actual_train_files, _ = validate_dataset_tokenizer_pair(args.data_path, args.tokenizer_path)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size)
+
+    mx.random.seed(args.seed)
+    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+    opt = SimpleOptimizers(model, args)
+
+    n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
+    log(f"run_id:{run_id}")
+    log(f"experiment:stochastic_think prob={think_prob}")
+    log(f"model_params:{n_params}")
+
+    # Warmup
+    for ws in range(args.warmup_steps):
+        x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len)
+        loss, grads = compiled_train(x, y)
+        mx.eval(loss, grads); mx.synchronize()
+        if ws + 1 == args.warmup_steps: log(f"warmup_step:{ws+1}/{args.warmup_steps}")
+    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+
+    train_time_ms = 0.0
+    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    stop_after_step = None
+    t0 = time.perf_counter()
+    step = 0
+
+    while True:
+        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+        if last_step:
+            # Eval with ALWAYS thinking (the payoff)
+            val_loss, val_bpb = eval_val(args, compiled_eval, val_tokens,
+                                         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+            train_time_ms += 1000.0 * (time.perf_counter() - t0)
+            log(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} train_time:{train_time_ms:.0f}ms (eval=always_think)")
+            if stop_after_step is not None:
+                log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}")
+
+            # Also eval WITHOUT thinking for comparison
+            compiled_eval_no_think = mx.compile(
+                lambda x, y: model.loss(x, y),
+                inputs=model.state, outputs=model.state,
+            )
+            # Force no-thinking by temporarily setting prob to 0
+            old_prob = model.think_prob
+            model.think_prob = 0.0
+            val_loss_no, val_bpb_no = eval_val(args, compiled_eval_no_think, val_tokens,
+                                                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+            model.think_prob = old_prob
+            log(f"val_no_think: val_loss:{val_loss_no:.4f} val_bpb:{val_bpb_no:.4f}")
+            break
+
+        lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
+        step_t0 = time.perf_counter()
+        x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len)
+        loss, grads = compiled_train(x, y)
+        train_loss_value = float(loss.item())
+        opt.step(model, grads, step=step, lr_mul=lr_mul)
+        mx.synchronize()
+
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
+        step += 1
+        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0):
+            log(f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms/step:.2f}ms")
+        if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
+            stop_after_step = step
+
+    # Save + quantize
+    flat_state = {k: v for k, v in tree_flatten(model.state)}
+    raw_path = out_dir / f"{run_id}_mlx_model.npz"
+    mx.savez(str(raw_path), **flat_state)
+    log(f"saved_model:{raw_path}")
+
+    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
+    quant_blob = zlib.compress(quant_raw, level=9)
+    log(f"serialized_model_int8_zlib:{len(quant_blob)} bytes")
+
+    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob)))
+    model.update(tree_unflatten(list(quant_flat.items())))
+    q_val_loss, q_val_bpb = eval_val(args, compiled_eval, val_tokens,
+                                      base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} (eval=always_think)")
+    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    return q_val_bpb
+
+
 EXPERIMENTS = {
     "proj_token": run_proj_token,
     "routed": run_routed,
     "lora_routed": run_lora_routed,
     "sparse_moe": run_sparse_moe,
     "attn_resid": run_attn_resid,
+    "attn_resid_opt": run_attn_resid_opt,
+    "stochastic_think": run_stochastic_think,
 }
+
+
+# ==============================================================================
+# EXPERIMENT 8: INDEPENDENT QK OPTIMIZED
+# Same as attn_resid_opt but with independent Q/K per layer, no output MLP.
+# Tests whether shared QK actually helps or just saves params.
+# ==============================================================================
+
+class GPT_IndepQKOpt(nn.Module):
+    """Optimized architecture with independent Q/K per layer.
+    L0: MLP-only + shift. L1-L7: full attention + MLP(2x) + shift. L8: MLP-only(3x) + shift.
+    No output MLP (it contributed 0% in attn_resid_opt)."""
+    def __init__(self, vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult,
+                 logit_softcap, rope_base, tied_embed_init_std, qk_gain_init,
+                 final_mlp_mult=3):
+        super().__init__()
+        self.logit_softcap = logit_softcap
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.blocks = []
+        for i in range(num_layers):
+            if i == 0 or i == num_layers - 1:
+                mult = final_mlp_mult if i == num_layers - 1 else mlp_mult
+                self.blocks.append(self._make_mlp_block(dim, mult))
+            else:
+                self.blocks.append(Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init))
+        self.final_norm = RMSNormNoWeight()
+        for b in self.blocks:
+            if hasattr(b, 'attn'):
+                b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        self.tok_emb.weight = (
+            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+        ).astype(COMPUTE_DTYPE)
+
+    def _make_mlp_block(self, dim, mlp_mult):
+        class _MLPBlock(nn.Module):
+            def __init__(self, d, m):
+                super().__init__()
+                self.mlp_norm = RMSNormNoWeight()
+                self.mlp = MLP(d, m)
+                self.mlp_scale = mx.ones((d,), dtype=mx.float32)
+                self.shift_weight = mx.zeros((d,), dtype=mx.float32)
+            def __call__(self, x, x0):
+                x_shifted = mx.concatenate([mx.zeros_like(x[:, :1, :]), x[:, :-1, :]], axis=1)
+                x = x + self.shift_weight.astype(x.dtype)[None, None, :] * x_shifted
+                x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+                return x
+        return _MLPBlock(dim, mlp_mult)
+
+    def __call__(self, input_ids):
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x; skips = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0); skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips: x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
+
+    def loss(self, input_ids, target_ids):
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        logits = self.logit_softcap * mx.tanh(
+            (x @ self.tok_emb.weight.astype(x.dtype).T) / self.logit_softcap
+        )
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+
+def run_indep_qk_opt(args, final_mlp_mult=3):
+    model = GPT_IndepQKOpt(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
+        tied_embed_init_std=args.tied_embed_init_std, qk_gain_init=args.qk_gain_init,
+        final_mlp_mult=final_mlp_mult,
+    )
+    return train_experiment(model, args, f"exp_indep_qk_opt_fm{final_mlp_mult}_{args.run_id}",
+                           f"indep_qk_opt: independent QK, no attn L0/L8, final_mlp={final_mlp_mult}x, no output MLP")
+
+
+# ==============================================================================
+# EXPERIMENT 9: FORKED HEAD (parallel output MLPs for full-rank logit space)
+# ==============================================================================
+
+class ForkOutputBlock(nn.Module):
+    """One fork of the parallel output. Shared QK attn + own V + MLP → dim residual."""
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, shared_qk):
+        super().__init__()
+        self.attn_norm = RMSNormNoWeight()
+        self.mlp_norm = RMSNormNoWeight()
+        self.shared_qk = shared_qk
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim = num_kv_heads * self.head_dim
+        self.c_v = CastedLinear(dim, kv_dim)
+        self.proj = CastedLinear(dim, dim)
+        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
+        self.mlp = MLP(dim, mlp_mult)
+        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+        self.shift_weight = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x):
+        # Shift
+        x_shifted = mx.concatenate([mx.zeros_like(x[:, :1, :]), x[:, :-1, :]], axis=1)
+        x_in = x + self.shift_weight.astype(x.dtype)[None, None, :] * x_shifted
+        # Attn with shared QK
+        x_normed = self.attn_norm(x_in)
+        bsz, seqlen, dim = x_normed.shape
+        v = self.c_v(x_normed).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        attn_out = self.shared_qk(x_normed, v)
+        attn_out = self.proj(attn_out)
+        x_in = x_in + self.attn_scale.astype(x_in.dtype)[None, None, :] * attn_out
+        # MLP
+        x_in = x_in + self.mlp_scale.astype(x_in.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_in))
+        # Return the delta (what this fork adds to the residual)
+        return x_in - x
+
+
+class GPT_ForkedHead(nn.Module):
+    """Shared QK model where L8 is replaced by two parallel output blocks.
+    Each block: shared QK attn + own V + MLP → V/2 logits.
+    Concatenated outputs form the full V logits. No tied output embedding.
+    """
+    def __init__(self, vocab_size, num_layers, dim, num_heads, num_kv_heads, mlp_mult,
+                 logit_softcap, rope_base, tied_embed_init_std, qk_gain_init,
+                 fork_mlp_mult=2):
+        super().__init__()
+        self.logit_softcap = logit_softcap
+        self.vocab_size = vocab_size
+        self.half_vocab = vocab_size // 2
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.shared_qk = SharedQKAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+
+        # Only num_layers - 1 blocks (L8 is replaced by forks)
+        num_inner = num_layers - 1  # 8 blocks: L0 is MLP-only, L1-L7 are attn
+        self.num_encoder_layers = num_inner // 2  # 4
+        self.num_decoder_layers = num_inner - self.num_encoder_layers  # 4
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+
+        self.blocks = []
+        for i in range(num_inner):
+            if i == 0:
+                self.blocks.append(self._make_mlp_block(dim, mlp_mult))
+            else:
+                self.blocks.append(AttnResidBlock(
+                    dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                    self.shared_qk,
+                ))
+
+        # Two parallel output forks instead of L8
+        self.fork_a = ForkOutputBlock(dim, num_heads, num_kv_heads, fork_mlp_mult, self.shared_qk)
+        self.fork_b = ForkOutputBlock(dim, num_heads, num_kv_heads, fork_mlp_mult, self.shared_qk)
+
+        # Nonlinear logit correction (breaks rank bottleneck)
+        self.null_fc = CastedLinear(dim, dim)
+        self.null_proj = CastedLinear(dim, vocab_size)
+
+        self.final_norm = RMSNormNoWeight()
+
+        for b in self.blocks:
+            if hasattr(b, 'proj'):
+                b.proj.weight = mx.zeros_like(b.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        # Zero-init fork output projections
+        self.fork_a.proj.weight = mx.zeros_like(self.fork_a.proj.weight)
+        self.fork_a.mlp.proj.weight = mx.zeros_like(self.fork_a.mlp.proj.weight)
+        self.fork_b.proj.weight = mx.zeros_like(self.fork_b.proj.weight)
+        self.fork_b.mlp.proj.weight = mx.zeros_like(self.fork_b.mlp.proj.weight)
+        # Zero-init null-space correction
+        self.null_proj.weight = mx.zeros_like(self.null_proj.weight)
+        self.tok_emb.weight = (
+            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+        ).astype(COMPUTE_DTYPE)
+
+    def _make_mlp_block(self, dim, mlp_mult):
+        class _MLPBlock(nn.Module):
+            def __init__(self, d, m):
+                super().__init__()
+                self.mlp_norm = RMSNormNoWeight()
+                self.mlp = MLP(d, m)
+                self.mlp_scale = mx.ones((d,), dtype=mx.float32)
+                self.shift_weight = mx.zeros((d,), dtype=mx.float32)
+            def __call__(self, x, x0):
+                x_shifted = mx.concatenate([mx.zeros_like(x[:, :1, :]), x[:, :-1, :]], axis=1)
+                x = x + self.shift_weight.astype(x.dtype)[None, None, :] * x_shifted
+                x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+                return x
+        return _MLPBlock(dim, mlp_mult)
+
+    def __call__(self, input_ids):
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x; skips = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0); skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips: x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        # Two parallel forks add back to residual stream
+        x = x + self.fork_a(x) + self.fork_b(x)
+        return self.final_norm(x)
+
+    def loss(self, input_ids, target_ids):
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        # Tied embedding logits (rank-512)
+        logits = x @ self.tok_emb.weight.astype(x.dtype).T
+        # Nonlinear null-space correction (breaks rank bottleneck)
+        h = nn.relu(self.null_fc(x))
+        logits = logits + self.null_proj(h * h)
+        logits = self.logit_softcap * mx.tanh(logits / self.logit_softcap)
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+
+
+def run_forked_head(args, fork_mlp_mult=2):
+    model = GPT_ForkedHead(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
+        tied_embed_init_std=args.tied_embed_init_std, qk_gain_init=args.qk_gain_init,
+        fork_mlp_mult=fork_mlp_mult,
+    )
+    return train_experiment(model, args, f"exp_forked_head_v2_{args.run_id}",
+                           f"forked_head_v2: L0-L7 + 2 parallel fork blocks with shared QK, each → V/2 logits")
+
+
+EXPERIMENTS["indep_qk_opt"] = run_indep_qk_opt
+EXPERIMENTS["attn_resid_loop"] = run_attn_resid_loop
+EXPERIMENTS["forked_head"] = run_forked_head
 
 if __name__ == "__main__":
     import argparse

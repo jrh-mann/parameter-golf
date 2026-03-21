@@ -85,6 +85,9 @@ class Hyperparameters:
     # Layer index where neuralese gets injected (0 = two-pass, >0 = mid-layer single-pass).
     neuralese_split_layer: int = int(os.environ.get("NEURALESE_SPLIT_LAYER", 0))
 
+    # Orthogonal regularization: penalize ||W^T W - I|| to force full-rank usage.
+    ortho_reg: float = float(os.environ.get("ORTHO_REG", 0.0))
+
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -470,6 +473,35 @@ class GPT(nn.Module):
                 skips = [mx.stack([s, s], axis=2).reshape(B, 2 * T, d) for s in skips]
 
         return self.final_norm(x)
+
+    def ortho_reg_loss(self) -> mx.array:
+        """Orthogonal regularization: penalize ||W^T W - I|| for 2D weight matrices.
+        Forces the model to use full rank of its weight matrices."""
+        reg = mx.array(0.0, dtype=mx.float32)
+        count = 0
+        for block in self.blocks:
+            for name in ["c_q", "c_k", "c_v", "proj"]:
+                W = getattr(block.attn, name).weight.astype(mx.float32)
+                # Use the smaller dimension for I
+                if W.shape[0] <= W.shape[1]:
+                    WWT = W @ W.T
+                    I = mx.eye(W.shape[0], dtype=mx.float32)
+                else:
+                    WWT = W.T @ W
+                    I = mx.eye(W.shape[1], dtype=mx.float32)
+                reg = reg + mx.mean((WWT - I) * (WWT - I))
+                count += 1
+            for name in ["fc", "proj"]:
+                W = getattr(block.mlp, name).weight.astype(mx.float32)
+                if W.shape[0] <= W.shape[1]:
+                    WWT = W @ W.T
+                    I = mx.eye(W.shape[0], dtype=mx.float32)
+                else:
+                    WWT = W.T @ W
+                    I = mx.eye(W.shape[1], dtype=mx.float32)
+                reg = reg + mx.mean((WWT - I) * (WWT - I))
+                count += 1
+        return reg / count
 
     def loss(self, input_ids: mx.array, target_ids: mx.array, neuralese: mx.array | None = None,
              split_layer: int = 0) -> mx.array:
@@ -960,9 +992,13 @@ def main() -> None:
     # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
+    _ortho = args.ortho_reg
     if args.neuralese_enabled:
         _split = args.neuralese_split_layer
         _loss_fn = lambda x, y: neuralese_loss_fn(model, x, y, split_layer=_split)
+    elif _ortho > 0:
+        def _loss_fn(x, y):
+            return model.loss(x, y) + _ortho * model.ortho_reg_loss()
     else:
         _loss_fn = lambda x, y: model.loss(x, y)
     compiled_loss = mx.compile(_loss_fn, inputs=model.state, outputs=model.state)
@@ -1010,6 +1046,8 @@ def main() -> None:
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     if args.neuralese_enabled:
         log(f"neuralese:enabled eval_passes:{args.neuralese_eval_passes} split_layer:{args.neuralese_split_layer}")
+    if args.ortho_reg > 0:
+        log(f"ortho_reg:{args.ortho_reg}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
